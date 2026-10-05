@@ -28,17 +28,18 @@ Three pieces of state survive restarts:
   it describes, so a failed write or commit leaves neither the business
   change nor a log entry behind.
 
-All reads and writes of the in-process state go through one lock, and a
-replacement persists the new entries, the new generation, every graph's new
-review result and its audit-log row in a single explicit SQLite transaction:
-either the whole change commits or nothing at all changes, so a registry can
-never be observed together with stale conclusions — not even after a write or
-commit failure, and not after the database is reopened. Sealing a package and
-recording its release are likewise single atomic writes: a failed write or
-commit never leaves a new package or a new release record behind. A purge
-commits its package updates together with its audit-log row the same way.
-A database written by an older release simply starts with an empty log: the
-audit table is created on open and nothing is backfilled.
+All reads and writes of an instance's state go through that store's one lock,
+and a replacement persists the new entries, the new generation, every graph's
+new review result and its audit-log row in a single explicit SQLite
+transaction: either the whole change commits or nothing at all changes, so a
+registry can never be observed together with stale conclusions — not even
+after a write or commit failure, and not after the database is reopened.
+Sealing a package and recording its release are likewise single atomic
+writes: a failed write or commit never leaves a new package or a new release
+record behind. A purge commits its package updates together with its
+audit-log row the same way. A database written by an older release simply
+starts with an empty log: the audit table is created on open and nothing is
+backfilled.
 """
 
 from __future__ import annotations
@@ -51,8 +52,11 @@ from contextlib import contextmanager
 from typing import Optional
 
 # Default database location inside the container; docker-compose mounts a named
-# volume there. Local runs create the file next to the working directory.
-DEFAULT_DB_PATH = os.environ.get("RISK_API_DB", "data/export-risk.db")
+# volume there. Local runs create the file next to the working directory. The
+# environment is read at app startup (not at import time), so an explicit path
+# handed to create_app() always wins and tests never touch disk on import.
+def default_db_path() -> str:
+    return os.environ.get("RISK_API_DB", "data/export-risk.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -101,10 +105,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 
 class Store:
-    """A single SQLite database guarded by one process-wide lock."""
+    """One SQLite database guarded by one lock.
 
-    def __init__(self, path: Optional[str] = DEFAULT_DB_PATH):
-        self._path = path or ":memory:"
+    Every application instance owns exactly one of these: the instance opens
+    its own connection on startup and closes it on shutdown. Instances never
+    share a connection or a lock, so two apps running side by side against two
+    different database files are fully independent — closing one never touches
+    the other's connection.
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self._path = path if path is not None else default_db_path()
         self.lock = threading.RLock()
         if self._path != ":memory:":
             parent = os.path.dirname(os.path.abspath(self._path))
@@ -486,9 +497,9 @@ class Store:
     def _insert_audit(self, entry_type: str, payload: dict[str, object]) -> int:
         """Append one audit row with the next shared, effect-order seq.
 
-        Callers serialize under the process-wide lock (and call this inside
-        the business transaction), so ``MAX(seq) + 1`` is exactly the order
-        the committed operations take effect in.
+        Callers serialize under this store's lock (and call this inside the
+        business transaction), so ``MAX(seq) + 1`` is exactly the order the
+        committed operations take effect in.
         """
         next_seq = self._conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM audit_log"
@@ -498,28 +509,3 @@ class Store:
             (next_seq, entry_type, json.dumps(payload, ensure_ascii=False)),
         )
         return next_seq
-
-
-# The shared process-wide store, created lazily so importing the app never
-# touches disk (tests and scripts stay free to rebind ``store`` first).
-store: Optional[Store] = None
-_store_lock = threading.Lock()
-
-
-def get_store() -> Store:
-    global store
-    if store is None:
-        with _store_lock:
-            if store is None:
-                store = Store()
-    return store
-
-
-def reset_store(path: Optional[str] = DEFAULT_DB_PATH) -> Store:
-    """Replace the process-wide store (tests use a throwaway database)."""
-    global store
-    with _store_lock:
-        if store is not None:
-            store.close()
-        store = Store(path)
-    return store

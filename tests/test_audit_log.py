@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import replace_store, restart_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -107,7 +107,7 @@ def all_records():
 
 
 def reopen_database():
-    reset_store(get_store()._path)
+    restart_store(app.state.store._path)
 
 
 # --------------------------------------------------------------- empty log --
@@ -394,7 +394,7 @@ def test_until_seq_above_max_is_rejected():
     assert error["max_seq"] == 1
     # The cutoff above the maximum is rejected on an empty log too, where the
     # only legal explicit cutoff is 0.
-    reset_store(str(get_store()._path) + ".fresh")
+    replace_store(app, str(app.state.store._path) + ".fresh")
     assert audit(until_seq=1).status_code == 400
     assert audit(until_seq=0).status_code == 200
 
@@ -438,7 +438,7 @@ def test_log_survives_restart():
 def test_old_database_starts_with_empty_log():
     # A database written before the audit feature existed: meta only, no
     # audit table. Opening it must not backfill anything.
-    path = str(get_store()._path) + ".legacy"
+    path = str(app.state.store._path) + ".legacy"
     con = sqlite3.connect(path)
     try:
         con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -447,7 +447,7 @@ def test_old_database_starts_with_empty_log():
     finally:
         con.close()
 
-    reset_store(path)
+    replace_store(app, path)
     body = audit().json()
     assert body == {"until_seq": 0, "records": [], "next_cursor": 0}
     # The first post-upgrade replacement starts the log at seq 1 and keeps the
@@ -506,7 +506,7 @@ class FaultyConnection:
 
 @pytest.fixture
 def faulty_conn():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy

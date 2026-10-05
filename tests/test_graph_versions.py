@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import restart_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -185,9 +185,9 @@ def test_revision_advances_version_under_the_same_id():
     assert got["nodes"] == GRAPH_V2["nodes"]
     assert got["export"] == "export_users"
     # The old version content is retained alongside the new head.
-    old = get_store().get_graph_version_row(gid, 1)
+    old = app.state.store.get_graph_version_row(gid, 1)
     assert json.loads(old["nodes"]) == GRAPH_V1["nodes"]
-    head = get_store().get_graph_version_row(gid, 2)
+    head = app.state.store.get_graph_version_row(gid, 2)
     assert json.loads(head["nodes"]) == GRAPH_V2["nodes"]
 
 
@@ -250,7 +250,7 @@ def test_revision_invalid_graph_is_rejected_without_storage_change():
     assert got["graph_version"] == 1
     assert got["nodes"] == GRAPH_V1["nodes"]
     # No dangling version-2 history row either.
-    assert get_store().get_graph_version_row(gid, 2) is None
+    assert app.state.store.get_graph_version_row(gid, 2) is None
 
 
 def test_revision_schema_errors_are_422():
@@ -447,17 +447,17 @@ def test_seal_after_revision_preview_rules_apply_to_the_new_version():
 
 def test_versions_and_bindings_survive_store_reopen(tmp_path):
     db_path = str(tmp_path / "versions.db")
-    reset_store(db_path)
+    restart_store(db_path)
     gid = register()
     v1_pkg = seal_ok(gid)
     revise_ok(gid, GRAPH_V2, 1)
     v2_pkg = seal_ok(gid, rows=ROWS_V2, conditions=CONDITIONS)
 
-    reset_store(db_path)
+    restart_store(db_path)
     got = client.get(f"/api/graphs/{gid}").json()
     assert got["graph_version"] == 2
     assert got["nodes"] == GRAPH_V2["nodes"]
-    store = get_store()
+    store = app.state.store
     assert json.loads(
         store.get_graph_version_row(gid, 1)["nodes"]
     ) == GRAPH_V1["nodes"]
@@ -517,12 +517,12 @@ def test_old_database_migrates_its_single_snapshot_to_version_one(tmp_path):
     conn.close()
 
     # Reopening migrates: the legacy graph and package belong to version 1.
-    reset_store(db_path)
+    restart_store(db_path)
     got = client.get("/api/graphs/g1").json()
     assert got["graph_version"] == 1
     assert got["nodes"] == GRAPH_V1["nodes"]
     assert got["review"]["blocked"] is False
-    assert get_store().get_package_row("p1")["graph_version"] == 1
+    assert app.state.store.get_package_row("p1")["graph_version"] == 1
 
     # The migrated package behaves exactly like a version-1 seal: release and
     # claim serve the frozen rows, and marking the legacy dependency blocks it.
@@ -585,7 +585,7 @@ class FaultyConnection:
 
 
 def test_failed_revision_write_leaves_no_trace():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy
@@ -610,7 +610,7 @@ def test_failed_revision_write_leaves_no_trace():
 
 
 def test_commit_failure_during_revision_rolls_back_everything():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy
@@ -654,7 +654,7 @@ def test_revision_and_replacement_take_effect_in_one_order(monkeypatch):
 
     def do_revise():
         outcomes["revise"] = registry.revise_graph(
-            gid, GRAPH_V2["nodes"], GRAPH_V2["export"], 1
+            app.state.store, gid, GRAPH_V2["nodes"], GRAPH_V2["export"], 1
         )
 
     worker = threading.Thread(target=do_revise)
@@ -663,7 +663,8 @@ def test_revision_and_replacement_take_effect_in_one_order(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(
+                app.state.store, [("users", "email")], 0),
         )
     )
     pending.start()

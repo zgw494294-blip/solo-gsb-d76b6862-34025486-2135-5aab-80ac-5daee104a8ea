@@ -137,6 +137,35 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 可用环境变量 `RISK_API_DB` 指定其他路径（如 `RISK_API_DB=/srv/risk.db`），删除该文件即回到
 “名录为空、generation 0、无登记图”的初始状态。
 
+### 同一进程内创建独立实例：`create_app(db_path=None)`
+
+除 `app.main:app` 入口外，应用还提供工厂函数 `create_app(db_path=None)`，每个应用实例
+**独立持有自己的 SQLite 连接、锁与全部状态**（登记图、图版本、名录代次、导出包、审计日志），
+实例启动（lifespan）时打开自己的库、退出时关闭自己的连接——同一进程里同时运行两个指向不同
+数据库的实例互不串用：关掉其中一个不会影响另一个的连接与读写，跨实例按 ID 查询对方的图或包
+一律返回 **404**。库路径选择规则：
+
+* **显式路径优先**：`create_app("/srv/risk-a.db")` 始终使用该路径；
+* **不传或传 `None`**：在**实例启动时**读取当时的 `RISK_API_DB`，未设置则沿用默认值
+  `data/export-risk.db`（环境变量只在启动时读取一次，不能靠运行中切换全局变量或环境变量来
+  改换“当前库”）。
+
+```python
+from fastapi.testclient import TestClient
+from app.main import create_app
+
+app_a = create_app("/srv/risk-a.db")
+app_b = create_app("/srv/risk-b.db")   # 与 app_a 完全独立
+with TestClient(app_a) as a, TestClient(app_b) as b:
+    ...
+# with 块退出即各自关闭自己的连接；关闭 app_a 不影响 app_b
+```
+
+`uvicorn app.main:app`、Dockerfile 与 `docker compose up` 单命令启动方式不变：模块级
+`app` 等价于 `create_app()`（不传路径，启动时读 `RISK_API_DB`）。同一实例的 HTTP 请求与内部
+业务调用使用同一存储和同一把锁，名录重审、历史图放行、样本清除与审计日志的原子性和操作次序
+保证与此前完全一致；旧库迁移、HTTP 方法/路径/字段/状态码与重启持久化行为也均不变。
+
 ## HTTP 调用示例
 
 ### 请求
@@ -1158,9 +1187,11 @@ curl -s -i -X POST http://localhost:8080/api/compare \
   `expected_generation` 重试，见下文“替换失败：整体回滚与重试”；
 * **持久化**：登记图（含**全部历史版本**）、名录、代次、审查结论、导出包（含绑定图版本与
   放行记录）与审计日志保存在 SQLite（默认 `data/export-risk.db`，可用环境变量
-  `RISK_API_DB` 覆盖）；Docker 部署时数据库位于 Compose **命名卷**上，容器重启后登记图、
-  版本历史、名录、导出包与审计记录仍然可用。**旧版数据库升级后审计日志从空开始**（不回填
-  历史），旧库中的图与包统一归为**版本 1**，之后的操作正常记 `seq=1、2、…`。
+  `RISK_API_DB` 覆盖，或以 `create_app(db_path)` 为实例显式指定）；Docker 部署时数据库位于
+  Compose **命名卷**上，容器重启后登记图、版本历史、名录、导出包与审计记录仍然可用。每个应用
+  实例独立持有自己的连接与锁，同进程多个实例指向不同库时互不串用（见上文“同一进程内创建独立
+  实例”）。**旧版数据库升级后审计日志从空开始**（不回填历史），旧库中的图与包统一归为
+  **版本 1**，之后的操作正常记 `seq=1、2、…`。
 
 旧接口 `/api/review`、`/api/preview`、`/api/revise`、`/api/prune`、`/api/rename`、
 `/api/compose`、`/api/compare` 的行为**完全不变**：它们只按请求图内的 `sensitive` 标记审查，
@@ -1180,8 +1211,8 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 
 ### 并发次序
 
-名录替换、图改版与登记、读取、登记图预演、导出包的封存/放行/领取/清除共用同一把进程级锁，
-按**某个先后次序整体生效**：改版、封存、名录替换各自要么完全发生在另一个之前、要么完全在
+名录替换、图改版与登记、读取、登记图预演、导出包的封存/放行/领取/清除共用同一把**实例级**锁
+（每个 `create_app` 实例各持一把，互不共享），在**同一实例内**按**某个先后次序整体生效**：改版、封存、名录替换各自要么完全发生在另一个之前、要么完全在
 其后。预演要么完全发生在替换之前（旧名录 + 旧结论），要么完全发生在替换之后（新名录 +
 新结论），绝不会用“新名录 + 旧结论”或“旧名录 + 新结论”放行；排队的替换重审的必然是提交时
 的图最新版。替换完成之后，任何凭替换前安全结论发起的预演都不能再返回样本数据。导出包同理：
@@ -1454,8 +1485,8 @@ curl -s -X PUT http://localhost:8080/api/graphs/$GID \
 * **代次闸门**：放行把**当前代次**盖在包上；领取只认“放行代次 == 当前代次”。名录每成功
   替换一次代次加一，旧放行立即失效——**即使名录改回安全（恢复），代次也已前进，仍须重新
   放行**才能领取。
-* **不得按旧代次放行或领取**：封存、放行、领取与名录替换共用同一把锁，按某个先后次序整体
-  生效（见上文“并发次序”）；过期代次的放行请求一律 409，不做任何修改。
+* **不得按旧代次放行或领取**：封存、放行、领取与名录替换共用同一把**实例级**锁，按某个先后
+  次序整体生效（见上文“并发次序”）；过期代次的放行请求一律 409，不做任何修改。
 * **失败不留痕**：封存写入或放行提交失败（如磁盘/命名卷故障）返回 **500** `INTERNAL`，
   不会留下新包或新放行记录，故障解除后原样重试即可。
 * **持久化**：包与放行记录与登记图、名录保存在**同一个 SQLite 数据库**（Compose 命名卷），
@@ -1820,8 +1851,8 @@ curl -s -X POST http://localhost:8080/api/packages/purge \
 
 ### 记录内容与编号
 
-* 两类操作**共用一条**按**生效顺序**递增的正整数 `seq`（1、2、3、…），与替换/清除共用
-  进程级锁的总次序一致；`seq` 只增不回收，失败与过期不占号。
+* 两类操作**共用一条**按**生效顺序**递增的正整数 `seq`（1、2、3、…，每个实例各自独立编号），
+  与替换/清除共用实例级锁的总次序一致；`seq` 只增不回收，失败与过期不占号。
 * **替换记录**：`type` 为 `"replace"`，带
   * `generation_before` / `generation_after`：替换前后的名录代次；
   * `added` / `removed`：相对旧名录**新增 / 删除**的源列，各为
@@ -1965,11 +1996,11 @@ python -m pytest tests/ -q
 ```
 app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphRevisionRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest、PackageReleaseRequest、PackagePurgeRequest）
 app/engine.py     图校验、拓扑排序、来源传播（图内标记 ∪ 名录的 OR 敏感集）、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演、两版导出风险对照，以及不受敏感标记限制的导出源列依赖判定
-app/registry.py   登记图/原 ID 改版（graph_version 乐观锁）/按图预演/名录读取与整份替换，导出包封存（绑定封存图版本）/放行（重审绑定历史版）/领取，按绑定历史版的源列清除已封存样本，以及审计日志翻页读取：锁内取快照、重审全部登记图最新版、世代/版本冲突、固定截止游标
-app/storage.py    SQLite 持久化（名录与 generation、登记图最新版与全部历史版本、导出包与绑定图版本/放行代次/已清除标记、两类操作共用 seq 的审计日志；改版追加与当前版指针、替换/清除与其审计行均在同一显式事务提交，写入/提交失败整体回滚；旧库打开时迁移为版本 1 并建空审计表）
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}（GET 读最新版、PUT 提交新版）、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/api/audit-log、/health）
+app/registry.py   登记图/原 ID 改版（graph_version 乐观锁）/按图预演/名录读取与整份替换，导出包封存（绑定封存图版本）/放行（重审绑定历史版）/领取，按绑定历史版的源列清除已封存样本，以及审计日志翻页读取：所有操作显式接收所属实例的存储，锁内取快照、重审全部登记图最新版、世代/版本冲突、固定截止游标
+app/storage.py    单实例 SQLite 持久化（名录与 generation、登记图最新版与全部历史版本、导出包与绑定图版本/放行代次/已清除标记、两类操作共用 seq 的审计日志；改版追加与当前版指针、替换/清除与其审计行均在同一显式事务提交，写入/提交失败整体回滚；旧库打开时迁移为版本 1 并建空审计表）；Store 由 create_app 实例独立持有，启动打开、退出关闭；默认路径在启动时读 RISK_API_DB
+app/main.py       FastAPI 工厂 create_app(db_path=None)（显式路径优先，否则启动时读 RISK_API_DB，默认 data/export-risk.db）与模块级入口 app=create_app()（uvicorn app.main:app/Docker/Compose 不变）；路由：/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}（GET 读最新版、PUT 提交新版）、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/api/audit-log、/health
 examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json、graph_version_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，图版本改版/版本冲突/阻断图保存/封存包绑版/绑定历史版放行与按旧来源清除/旧库迁移版本 1，导出包封存/放行/领取/失败不留痕，按源列清除已封存样本，以及名录替换/样本清除审计日志的记录内容、翻页、固定截止、重启保留、旧库空日志与同事务回滚测试
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，图版本改版/版本冲突/阻断图保存/封存包绑版/绑定历史版放行与按旧来源清除/旧库迁移版本 1，导出包封存/放行/领取/失败不留痕，按源列清除已封存样本，以及名录替换/样本清除审计日志的记录内容、翻页、固定截止、重启保留、旧库空日志与同事务回滚测试；test_instances.py 覆盖同进程双实例（不同库）的图/版本/代次/包/审计互不串用、跨实例 404、双实例交错操作、一个实例关闭后另一个继续读写与重启、显式路径优先于 RISK_API_DB/缺省启动读环境变量、以及回滚边界互不影响
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```

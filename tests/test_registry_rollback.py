@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import restart_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -108,7 +108,7 @@ class FaultyConnection:
 
 @pytest.fixture
 def faulty_conn():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy
@@ -155,8 +155,8 @@ def assert_initial_state(graph_ids):
 
 
 def reopen_database():
-    """Simulate a restart: drop the process-wide store, reopen the file."""
-    reset_store(get_store()._path)
+    """Simulate a restart: drop this app's store, reopen the file."""
+    restart_store(app.state.store._path)
 
 
 # ------------------------- failure mid-transaction --------------------------

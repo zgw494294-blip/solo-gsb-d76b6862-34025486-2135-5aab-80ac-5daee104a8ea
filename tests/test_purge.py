@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import restart_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -266,7 +266,7 @@ def test_unmatched_columns_purge_nothing_and_change_nothing():
     assert resp.status_code == 200
     assert resp.json() == {"purged": []}
     # The package is fully intact: rows, release record, no purged marker.
-    row = get_store().get_package_row(pid)
+    row = app.state.store.get_package_row(pid)
     assert row["purged"] == 0
     assert json.loads(row["rows"]) == SEALED_ROWS
     assert row["release_generation"] == 0
@@ -278,7 +278,7 @@ def test_purge_clears_rows_and_release_record_but_keeps_columns():
     pid = seal_ok(gid)
     release(pid, 0)
     assert purge(("users", "email")).json()["purged"] == [pid]
-    row = get_store().get_package_row(pid)
+    row = app.state.store.get_package_row(pid)
     assert row["purged"] == 1
     assert json.loads(row["rows"]) == []
     assert row["release_generation"] is None
@@ -405,17 +405,17 @@ def test_purge_request_schema_violations_are_422():
 
 def test_purged_marker_survives_store_reopen(tmp_path):
     db_path = str(tmp_path / "purge.db")
-    reset_store(db_path)
+    restart_store(db_path)
     gid = register()
     pid = seal_ok(gid)
     release(pid, 0)
     assert purge(("users", "email")).json()["purged"] == [pid]
 
     # Simulate a restart: drop the process-wide store, reopen the same file.
-    reset_store(db_path)
+    restart_store(db_path)
     assert client.get(f"/api/packages/{pid}").status_code == 410
     assert release(pid, 0).status_code == 410
-    row = get_store().get_package_row(pid)
+    row = app.state.store.get_package_row(pid)
     assert row["purged"] == 1
     assert json.loads(row["rows"]) == []
 
@@ -445,9 +445,9 @@ def test_database_from_before_the_purged_column_keeps_working(tmp_path):
     )
     conn.close()
 
-    reset_store(db_path)
+    restart_store(db_path)
     # The old file gained the purged column; the old package is live.
-    row = get_store().get_package_row("p1")
+    row = app.state.store.get_package_row("p1")
     assert row["purged"] == 0
     assert json.loads(row["rows"]) == [[1]]
     assert row["release_generation"] == 0
@@ -500,7 +500,7 @@ class FaultyConnection:
 
 @pytest.fixture
 def faulty_conn():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy
@@ -523,7 +523,7 @@ def test_failed_purge_leaves_every_package_unchanged(faulty_conn):
     # The whole batch was rolled back: neither package was purged.
     assert client.get(f"/api/packages/{p1}").status_code == 200
     assert client.get(f"/api/packages/{p2}").status_code == 200
-    assert all(row["purged"] == 0 for row in get_store().list_package_rows())
+    assert all(row["purged"] == 0 for row in app.state.store.list_package_rows())
 
     # Fault cleared: the same purge succeeds and lists both, sorted.
     resp = purge(("users", "email"), ("s2", "x"))
@@ -575,7 +575,8 @@ def test_purge_and_claim_take_effect_in_one_order(monkeypatch):
     outcomes = {}
 
     def do_purge():
-        outcomes["purge"] = registry.purge_packages([("users", "email")])
+        outcomes["purge"] = registry.purge_packages(
+            app.state.store, [("users", "email")])
 
     worker = threading.Thread(target=do_purge)
     worker.start()
@@ -583,7 +584,7 @@ def test_purge_and_claim_take_effect_in_one_order(monkeypatch):
 
     def do_claim():
         try:
-            outcomes["claim"] = registry.claim_package(pid)
+            outcomes["claim"] = registry.claim_package(app.state.store, pid)
         except registry.PackagePurged:
             outcomes["claim"] = "purged"
 

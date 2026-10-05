@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import restart_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -118,7 +118,7 @@ def test_seal_input_error_creates_no_package():
                        json={"rows": {}, "conditions": CONDITIONS})
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "PREVIEW_SOURCE_COVERAGE"
-    assert get_store().list_package_rows() == []
+    assert app.state.store.list_package_rows() == []
 
     # Wrong row keys: same row-key error as the preview, still no package.
     resp = client.post(
@@ -127,7 +127,7 @@ def test_seal_input_error_creates_no_package():
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "PREVIEW_ROW_KEYS"
-    assert get_store().list_package_rows() == []
+    assert app.state.store.list_package_rows() == []
 
     # Extra body field stays a schema error: 422, no package either.
     resp = client.post(
@@ -135,7 +135,7 @@ def test_seal_input_error_creates_no_package():
         json={"rows": ROWS, "conditions": CONDITIONS, "nodes": []},
     )
     assert resp.status_code == 422
-    assert get_store().list_package_rows() == []
+    assert app.state.store.list_package_rows() == []
 
 
 def test_seal_blocked_creates_no_package():
@@ -147,7 +147,7 @@ def test_seal_blocked_creates_no_package():
     assert error["code"] == "PREVIEW_BLOCKED"
     assert "rows" not in error and "columns" not in error
     assert error["review"]["blocked"] is True
-    assert get_store().list_package_rows() == []
+    assert app.state.store.list_package_rows() == []
 
 
 # ------------------------------- releasing ----------------------------------
@@ -318,14 +318,14 @@ def test_claim_never_recomputes_the_sealed_data():
 
 def test_packages_and_releases_survive_store_reopen(tmp_path):
     db_path = str(tmp_path / "packages.db")
-    reset_store(db_path)
+    restart_store(db_path)
     gid = register()
     released = seal_ok(gid)
     release(released, 0)
     unreleased = seal_ok(gid)
 
-    # Simulate a restart: drop the process-wide store, reopen the same file.
-    reset_store(db_path)
+    # Simulate a restart: drop this app's store, reopen the same file.
+    restart_store(db_path)
     body = client.get(f"/api/packages/{released}").json()
     assert body["graph_id"] == gid
     assert body["generation"] == 0
@@ -385,7 +385,7 @@ class FaultyConnection:
 
 @pytest.fixture
 def faulty_conn():
-    store = get_store()
+    store = app.state.store
     real = store._conn
     proxy = FaultyConnection(real)
     store._conn = proxy
@@ -399,12 +399,12 @@ def test_failed_seal_insert_leaves_no_package(faulty_conn):
     resp = seal(gid, http=no_raise)
     assert resp.status_code == 500
     assert resp.json()["error"]["code"] == "INTERNAL"
-    assert get_store().list_package_rows() == []
+    assert app.state.store.list_package_rows() == []
 
     # Fault cleared: the same seal succeeds.
     resp = seal(gid)
     assert resp.status_code == 201
-    assert len(get_store().list_package_rows()) == 1
+    assert len(app.state.store.list_package_rows()) == 1
 
 
 def test_failed_release_update_leaves_no_release_record(faulty_conn):
@@ -451,7 +451,7 @@ def test_release_and_replacement_take_effect_in_one_order(monkeypatch):
     outcomes = {}
 
     def do_release():
-        outcomes["release"] = registry.release_package(pid, 0)
+        outcomes["release"] = registry.release_package(app.state.store, pid, 0)
 
     worker = threading.Thread(target=do_release)
     worker.start()
@@ -460,7 +460,8 @@ def test_release_and_replacement_take_effect_in_one_order(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(
+                app.state.store, [("users", "email")], 0),
         )
     )
     pending.start()

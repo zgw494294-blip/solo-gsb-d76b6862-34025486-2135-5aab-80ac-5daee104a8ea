@@ -9,7 +9,7 @@ from app import registry
 from app.engine import review
 from app.main import app
 from app.models import ReviewRequest
-from app.storage import get_store, reset_store
+from conftest import restart_store
 
 
 client = TestClient(app)
@@ -93,7 +93,7 @@ def test_register_invalid_graph_is_rejected_without_storage_change():
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "INVALID_REFERENCE"
     # Nothing was stored: graph count stays zero.
-    assert get_store().list_graph_rows() == []
+    assert app.state.store.list_graph_rows() == []
     # Schema problems stay 422.
     resp = client.post("/api/graphs", json={"nodes": GRAPH["nodes"],
                                             "export": "export_users",
@@ -264,7 +264,9 @@ def test_failed_rereview_changes_nothing(monkeypatch):
 
     monkeypatch.setattr(reg_mod, "run_review", boom)
     with pytest.raises(RuntimeError):
-        registry.replace_registry([("users", "email")], 0)
+        registry.replace_registry(
+            app.state.store, [("users", "email")], 0
+        )
 
     got = client.get(f"/api/graphs/{gid}").json()
     assert got["generation"] == 0
@@ -443,7 +445,9 @@ def test_preview_and_replacement_never_mix_registry_and_conclusion(monkeypatch):
     outcomes = {}
 
     def do_preview():
-        outcomes["preview"] = registry.preview_graph(gid, ROWS, CONDITIONS)
+        outcomes["preview"] = registry.preview_graph(
+            app.state.store, gid, ROWS, CONDITIONS
+        )
 
     worker = threading.Thread(target=do_preview)
     worker.start()
@@ -452,7 +456,9 @@ def test_preview_and_replacement_never_mix_registry_and_conclusion(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(
+                app.state.store, [("users", "email")], 0
+            ),
         )
     )
     pending.start()
@@ -486,7 +492,7 @@ def test_concurrent_replacements_serialize_one_stales_out():
         barrier.wait()
         try:
             registry.replace_registry(
-                [("users", "email")], generation)
+                app.state.store, [("users", "email")], generation)
             outcomes.append(200)
         except registry.StaleGeneration:
             outcomes.append(409)
@@ -522,13 +528,13 @@ def test_concurrent_registration_then_replacement_are_consistent():
 
 def test_state_survives_store_reopen(tmp_path):
     db_path = str(tmp_path / "persist.db")
-    reset_store(db_path)
+    restart_store(db_path)
     gid = register()["id"]
     put_registry([{"source": "users", "column": "email"}], 0)
     assert client.get(f"/api/graphs/{gid}").json()["review"]["blocked"] is True
 
-    # Simulate a restart: drop the process-wide store and reopen the same file.
-    reset_store(db_path)
+    # Simulate a restart: drop this app's store and reopen the same file.
+    restart_store(db_path)
     body = client.get("/api/sensitive-columns").json()
     assert body["generation"] == 1
     assert body["entries"] == [{"source": "users", "column": "email"}]
