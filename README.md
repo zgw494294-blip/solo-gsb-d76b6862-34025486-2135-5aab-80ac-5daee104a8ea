@@ -137,6 +137,32 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 可用环境变量 `RISK_API_DB` 指定其他路径（如 `RISK_API_DB=/srv/risk.db`），删除该文件即回到
 “名录为空、generation 0、无登记图”的初始状态。
 
+### 在同一进程内创建多个实例
+
+登记图、共用敏感列名录、待放行导出包与审计日志的 SQLite 存储由**每个应用实例独立持有**
+（各自的连接与锁），不再使用进程级全局单例。需要把服务嵌入 Python 进程（例如同进程并行
+使用两个不同库）时，用应用工厂显式创建实例：
+
+```python
+from app.main import create_app
+
+app_a = create_app("/srv/risk-a.db")   # 显式路径：只对该实例生效，优先级最高
+app_b = create_app("/srv/risk-b.db")   # 另一个实例、另一个库，互不串用
+```
+
+`create_app(db_path=None)` 的选库规则：传入显式路径时一律使用该路径；不传时在**实例启动
+时**读取 `RISK_API_DB`，未设置则沿用默认值 `data/export-risk.db`。实例在 lifespan 启动时
+打开自己的连接（卷缺失或不可写会在启动时暴露），退出时只关闭自己的连接——关闭一个实例
+不影响另一个。两个实例的登记图、图版本、名录代次、导出包与审计日志完全隔离：在一个实例
+里登记的图或封存的包，经另一个实例查询一律是 404 `GRAPH_NOT_FOUND` / `PACKAGE_NOT_FOUND`；
+名录重审、历史图版本放行、样本清除与审计日志的原子性和操作次序保证仍然各自成立，但**不
+能**通过修改全局变量或环境变量来切换某个实例当前使用的库。
+
+模块级入口 `app.main:app` 保持不变：它等价于 `create_app()`（启动时解析 `RISK_API_DB`），
+因此 Dockerfile 的 `uvicorn app.main:app --host 0.0.0.0 --port 8080` 与
+`docker compose up --build` 单命令启动方式继续可用，HTTP 方法、路径、字段、状态码、旧库
+迁移与重启持久化行为均不变。
+
 ## HTTP 调用示例
 
 ### 请求

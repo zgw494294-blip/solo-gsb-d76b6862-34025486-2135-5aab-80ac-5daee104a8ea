@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import get_store, reset_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -575,7 +575,7 @@ def test_purge_and_claim_take_effect_in_one_order(monkeypatch):
     outcomes = {}
 
     def do_purge():
-        outcomes["purge"] = registry.purge_packages([("users", "email")])
+        outcomes["purge"] = registry.purge_packages(get_store(), [("users", "email")])
 
     worker = threading.Thread(target=do_purge)
     worker.start()
@@ -583,7 +583,7 @@ def test_purge_and_claim_take_effect_in_one_order(monkeypatch):
 
     def do_claim():
         try:
-            outcomes["claim"] = registry.claim_package(pid)
+            outcomes["claim"] = registry.claim_package(get_store(), pid)
         except registry.PackagePurged:
             outcomes["claim"] = "purged"
 

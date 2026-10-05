@@ -28,17 +28,23 @@ Three pieces of state survive restarts:
   it describes, so a failed write or commit leaves neither the business
   change nor a log entry behind.
 
-All reads and writes of the in-process state go through one lock, and a
-replacement persists the new entries, the new generation, every graph's new
-review result and its audit-log row in a single explicit SQLite transaction:
-either the whole change commits or nothing at all changes, so a registry can
-never be observed together with stale conclusions — not even after a write or
-commit failure, and not after the database is reopened. Sealing a package and
-recording its release are likewise single atomic writes: a failed write or
-commit never leaves a new package or a new release record behind. A purge
-commits its package updates together with its audit-log row the same way.
-A database written by an older release simply starts with an empty log: the
-audit table is created on open and nothing is backfilled.
+All reads and writes against one database go through that database's own
+lock, and a replacement persists the new entries, the new generation, every
+graph's new review result and its audit-log row in a single explicit SQLite
+transaction: either the whole change commits or nothing at all changes, so a
+registry can never be observed together with stale conclusions — not even
+after a write or commit failure, and not after the database is reopened.
+Sealing a package and recording its release are likewise single atomic
+writes: a failed write or commit never leaves a new package or a new release
+record behind. A purge commits its package updates together with its
+audit-log row the same way. A database written by an older release simply
+starts with an empty log: the audit table is created on open and nothing is
+backfilled.
+
+Each application instance (see :func:`app.main.create_app`) owns its own
+:class:`Store` — its own SQLite connection and lock — for its whole lifetime:
+the instance opens the connection at startup and closes it at shutdown, and
+two instances bound to different database files never share state.
 """
 
 from __future__ import annotations
@@ -52,7 +58,22 @@ from typing import Optional
 
 # Default database location inside the container; docker-compose mounts a named
 # volume there. Local runs create the file next to the working directory.
-DEFAULT_DB_PATH = os.environ.get("RISK_API_DB", "data/export-risk.db")
+DEFAULT_DB_FILENAME = "data/export-risk.db"
+
+
+def resolve_db_path(db_path: Optional[str] = None) -> str:
+    """Resolve the database file for one application instance.
+
+    An explicitly configured path always wins; otherwise the location is read
+    from the ``RISK_API_DB`` environment variable at startup, falling back to
+    :data:`DEFAULT_DB_FILENAME`. The environment is consulted when the
+    instance is opened rather than at import time, but it is never used to
+    switch an already running instance's database: every instance keeps the
+    path it resolved.
+    """
+    if db_path:
+        return db_path
+    return os.environ.get("RISK_API_DB", DEFAULT_DB_FILENAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -101,11 +122,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 
 class Store:
-    """A single SQLite database guarded by one process-wide lock."""
+    """One SQLite database guarded by one per-database lock.
 
-    def __init__(self, path: Optional[str] = DEFAULT_DB_PATH):
+    Multiple :class:`Store` instances may live in the same process; each
+    carries its own connection and lock, so the operation ordering guarantees
+    (registry re-review, historical-graph release, purge and audit-log
+    atomicity) are scoped to exactly one instance and never serialize or mix
+    two different databases.
+    """
+
+    def __init__(self, path: Optional[str] = None):
         self._path = path or ":memory:"
         self.lock = threading.RLock()
+        self._closed = False
         if self._path != ":memory:":
             parent = os.path.dirname(os.path.abspath(self._path))
             os.makedirs(parent, exist_ok=True)
@@ -166,6 +195,9 @@ class Store:
 
     def close(self) -> None:
         with self.lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
 
     # -------------------------------------------------------- transactions --
@@ -486,9 +518,9 @@ class Store:
     def _insert_audit(self, entry_type: str, payload: dict[str, object]) -> int:
         """Append one audit row with the next shared, effect-order seq.
 
-        Callers serialize under the process-wide lock (and call this inside
-        the business transaction), so ``MAX(seq) + 1`` is exactly the order
-        the committed operations take effect in.
+        Callers serialize under this store's lock (and call this inside the
+        business transaction), so ``MAX(seq) + 1`` is exactly the order the
+        committed operations take effect in within this instance's database.
         """
         next_seq = self._conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM audit_log"
@@ -500,26 +532,63 @@ class Store:
         return next_seq
 
 
-# The shared process-wide store, created lazily so importing the app never
-# touches disk (tests and scripts stay free to rebind ``store`` first).
-store: Optional[Store] = None
-_store_lock = threading.Lock()
+class StoreHolder:
+    """Own one :class:`Store` for the lifetime of one application instance.
 
+    The holder remembers the database path the instance was configured with;
+    an explicit ``db_path`` always wins, otherwise the path is resolved from
+    ``RISK_API_DB`` (and its default) when the connection is first opened.
+    The application opens the store at lifespan startup — so a missing or
+    unwritable volume fails startup eagerly — and closes it at shutdown.
+    Closing one instance's store only closes that one connection: every other
+    holder (and thus every other application instance in the process) keeps
+    its own connection open and usable.
+    """
 
-def get_store() -> Store:
-    global store
-    if store is None:
-        with _store_lock:
-            if store is None:
-                store = Store()
-    return store
+    def __init__(self, db_path: Optional[str] = None):
+        self._configured_path = db_path
+        self._path: Optional[str] = None
+        self._store: Optional[Store] = None
+        self._guard = threading.Lock()
 
+    def open(self) -> Store:
+        """Open (creating/migrating, if needed) this instance's connection."""
+        with self._guard:
+            if self._store is None:
+                self._path = resolve_db_path(self._configured_path)
+                self._store = Store(self._path)
+            return self._store
 
-def reset_store(path: Optional[str] = DEFAULT_DB_PATH) -> Store:
-    """Replace the process-wide store (tests use a throwaway database)."""
-    global store
-    with _store_lock:
+    def get(self) -> Store:
+        """Return the open store, opening it on first use."""
+        # Fast path without the guard once the instance is up and running.
+        store = self._store
         if store is not None:
-            store.close()
-        store = Store(path)
-    return store
+            return store
+        return self.open()
+
+    def close(self) -> None:
+        """Close this instance's connection; other instances are untouched."""
+        with self._guard:
+            if self._store is not None:
+                self._store.close()
+                self._store = None
+
+    def reset(self, db_path: Optional[str] = None) -> Store:
+        """Drop the current connection and open a fresh database.
+
+        Used by tests to give an instance a throwaway database and to simulate
+        a restart against the same file. Production request handling never
+        calls this.
+        """
+        with self._guard:
+            if self._store is not None:
+                self._store.close()
+            self._configured_path = db_path
+            self._path = resolve_db_path(db_path)
+            self._store = Store(self._path)
+            return self._store
+
+    @property
+    def path(self) -> str:
+        return self.get()._path

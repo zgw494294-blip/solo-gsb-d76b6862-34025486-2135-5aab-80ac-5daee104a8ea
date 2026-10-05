@@ -1,8 +1,12 @@
 """Registered-graph and shared-registry operations on top of the engine.
 
-Every operation here runs under the store's single lock, so registration,
-revisions, reads, registered previews, package sealing/releasing/claiming/
-purging and registry replacements take effect in one observable total order.
+Every operation here runs under the lock of the :class:`~app.storage.Store`
+it was handed, and every helper call inside one operation uses that same
+store, so registration, revisions, reads, registered previews, package
+sealing/releasing/claiming/purging and registry replacements take effect in
+one observable total order *within one application instance*. Each instance
+owns its own store (its own SQLite connection and lock); two instances never
+serialize against each other and never see each other's data.
 A registered graph carries a version history under one fixed id: a revision
 submits a new version with an optimistic ``expected_version`` (rejected as
 409 when stale, as 404 when the id is unknown) and moves the graph's head;
@@ -30,7 +34,7 @@ from .engine import export_dependencies
 from .engine import preview as run_preview
 from .engine import review as run_review
 from .models import PreviewRequest, ReviewRequest
-from .storage import get_store
+from .storage import Store
 
 
 class GraphNotFound(Exception):
@@ -116,13 +120,16 @@ class StaleGeneration(Exception):
         self.current = current
 
 
-def _registry_snapshot() -> tuple[frozenset[tuple[str, str]], int]:
-    db = get_store()
+def _registry_snapshot(
+    db: Store,
+) -> tuple[frozenset[tuple[str, str]], int]:
     return frozenset(db.get_entries()), db.get_generation()
 
 
 def register_graph(
-    nodes: list[dict[str, object]], export: str
+    db: Store,
+    nodes: list[dict[str, object]],
+    export: str,
 ) -> dict[str, object]:
     """Validate a whole submitted graph, review it under the current registry.
 
@@ -135,9 +142,8 @@ def register_graph(
     # the other endpoints; the engine re-validates under the registry snapshot.
     ReviewRequest.model_validate({"nodes": nodes, "export": export})
 
-    db = get_store()
     with db.lock:
-        extra_sensitive, generation = _registry_snapshot()
+        extra_sensitive, generation = _registry_snapshot(db)
         request = ReviewRequest.model_validate(
             {"nodes": nodes, "export": export}
         )
@@ -154,6 +160,7 @@ def register_graph(
 
 
 def revise_graph(
+    db: Store,
     graph_id: str,
     nodes: list[dict[str, object]],
     export: str,
@@ -180,7 +187,6 @@ def revise_graph(
     # endpoint; the engine re-validates under the registry snapshot.
     ReviewRequest.model_validate({"nodes": nodes, "export": export})
 
-    db = get_store()
     with db.lock:
         row = db.get_graph_row(graph_id)
         if row is None:
@@ -188,7 +194,7 @@ def revise_graph(
         current_version = row["current_version"]
         if expected_version != current_version:
             raise StaleVersion(expected_version, current_version)
-        extra_sensitive, generation = _registry_snapshot()
+        extra_sensitive, generation = _registry_snapshot(db)
         request = ReviewRequest.model_validate(
             {"nodes": nodes, "export": export}
         )
@@ -206,9 +212,8 @@ def revise_graph(
         }
 
 
-def read_graph(graph_id: str) -> dict[str, object]:
+def read_graph(db: Store, graph_id: str) -> dict[str, object]:
     """Return the latest version plus the current generation and review."""
-    db = get_store()
     with db.lock:
         row = db.get_graph_row(graph_id)
         if row is None:
@@ -224,6 +229,7 @@ def read_graph(graph_id: str) -> dict[str, object]:
 
 
 def preview_graph(
+    db: Store,
     graph_id: str,
     rows: dict[str, list[dict[str, object]]],
     conditions: dict[str, dict[str, object]],
@@ -236,12 +242,11 @@ def preview_graph(
     lock as the stored review conclusions, so the block decision can never be
     based on a different registry than the conclusion returned.
     """
-    db = get_store()
     with db.lock:
         row = db.get_graph_row(graph_id)
         if row is None:
             raise GraphNotFound(graph_id)
-        extra_sensitive, generation = _registry_snapshot()
+        extra_sensitive, generation = _registry_snapshot(db)
         request = PreviewRequest.model_validate(
             {
                 "nodes": _loads(row["nodes"]),
@@ -262,6 +267,7 @@ def preview_graph(
 
 
 def seal_package(
+    db: Store,
     graph_id: str,
     rows: dict[str, list[dict[str, object]]],
     conditions: dict[str, dict[str, object]],
@@ -278,13 +284,12 @@ def seal_package(
     just the new package id, the bound graph version and that creation
     generation.
 """
-    db = get_store()
     with db.lock:
         row = db.get_graph_row(graph_id)
         if row is None:
             raise GraphNotFound(graph_id)
         graph_version = row["current_version"]
-        extra_sensitive, generation = _registry_snapshot()
+        extra_sensitive, generation = _registry_snapshot(db)
         request = PreviewRequest.model_validate(
             {
                 "nodes": _loads(row["nodes"]),
@@ -311,6 +316,7 @@ def seal_package(
 
 
 def release_package(
+    db: Store,
     package_id: str, expected_generation: int
 ) -> dict[str, object]:
     """Release a sealed package under the current registry generation.
@@ -327,14 +333,13 @@ def release_package(
     overwrites the previous release generation. A purged package can never be
     released again (:class:`PackagePurged`, HTTP 410).
 """
-    db = get_store()
     with db.lock:
         row = db.get_package_row(package_id)
         if row is None:
             raise PackageNotFound(package_id)
         if row["purged"]:
             raise PackagePurged(package_id)
-        extra_sensitive, generation = _registry_snapshot()
+        extra_sensitive, generation = _registry_snapshot(db)
         if expected_generation != generation:
             raise StaleGeneration(expected_generation, generation)
         graph_version = row["graph_version"]
@@ -362,7 +367,7 @@ def release_package(
         return {"id": package_id, "release_generation": generation}
 
 
-def claim_package(package_id: str) -> dict[str, object]:
+def claim_package(db: Store, package_id: str) -> dict[str, object]:
     """Hand out a sealed package's frozen sample data.
 
     Nothing is recomputed: the stored ``columns``/``rows`` are returned
@@ -374,7 +379,6 @@ def claim_package(package_id: str) -> dict[str, object]:
     sample data. A purged package is rejected as :class:`PackagePurged`
     (HTTP 410) forever.
 """
-    db = get_store()
     with db.lock:
         row = db.get_package_row(package_id)
         if row is None:
@@ -408,7 +412,9 @@ def _source_columns(pairs: set[tuple[str, str]] | frozenset[tuple[str, str]]):
     ]
 
 
-def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
+def purge_packages(
+    db: Store, columns: list[tuple[str, str]]
+) -> dict[str, object]:
     """Purge every live package whose export depends on a listed column.
 
     The dependency decision follows the original content-provenance and
@@ -432,7 +438,6 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
     the same lock as seal/release/claim, so a failed write or commit leaves
     every package and the log exactly as they were.
     """
-    db = get_store()
     targets = frozenset(columns)
     with db.lock:
         # Snapshot the still-live packages grouped by graph AND the bound
@@ -471,8 +476,7 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
         return {"purged": purged}
 
 
-def get_registry() -> dict[str, object]:
-    db = get_store()
+def get_registry(db: Store) -> dict[str, object]:
     with db.lock:
         return {
             "generation": db.get_generation(),
@@ -484,6 +488,7 @@ def get_registry() -> dict[str, object]:
 
 
 def replace_registry(
+    db: Store,
     entries: list[tuple[str, str]], expected_generation: int
 ) -> dict[str, object]:
     """Replace the whole registry and re-review every registered graph.
@@ -499,7 +504,6 @@ def replace_registry(
     contents are identical to the current list still changes the generation
     and is still recorded, with empty added/removed lists.
     """
-    db = get_store()
     with db.lock:
         current = db.get_generation()
         if expected_generation != current:
@@ -548,6 +552,7 @@ class UntilSeqOutOfRange(Exception):
 
 
 def read_audit_log(
+    db: Store,
     after_seq: int, limit: int, until_seq: int | None = None
 ) -> dict[str, object]:
     """Return one page of the committed audit log, seq ascending.
@@ -560,7 +565,6 @@ def read_audit_log(
     records and the next cursor — the last returned seq, or ``after_seq``
     itself when the page is empty.
     """
-    db = get_store()
     with db.lock:
         max_seq = db.max_audit_seq()
         if until_seq is None:

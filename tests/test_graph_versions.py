@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import get_store, reset_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -654,7 +654,7 @@ def test_revision_and_replacement_take_effect_in_one_order(monkeypatch):
 
     def do_revise():
         outcomes["revise"] = registry.revise_graph(
-            gid, GRAPH_V2["nodes"], GRAPH_V2["export"], 1
+            get_store(), gid, GRAPH_V2["nodes"], GRAPH_V2["export"], 1
         )
 
     worker = threading.Thread(target=do_revise)
@@ -663,7 +663,7 @@ def test_revision_and_replacement_take_effect_in_one_order(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(get_store(), [("users", "email")], 0),
         )
     )
     pending.start()

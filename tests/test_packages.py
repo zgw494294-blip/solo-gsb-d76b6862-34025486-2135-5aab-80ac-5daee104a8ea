@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import registry
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import get_store, reset_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.
@@ -451,7 +451,7 @@ def test_release_and_replacement_take_effect_in_one_order(monkeypatch):
     outcomes = {}
 
     def do_release():
-        outcomes["release"] = registry.release_package(pid, 0)
+        outcomes["release"] = registry.release_package(get_store(), pid, 0)
 
     worker = threading.Thread(target=do_release)
     worker.start()
@@ -460,7 +460,7 @@ def test_release_and_replacement_take_effect_in_one_order(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(get_store(), [("users", "email")], 0),
         )
     )
     pending.start()

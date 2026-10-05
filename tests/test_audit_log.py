@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.storage import get_store, reset_store
+from conftest import get_store, reset_store
 
 client = TestClient(app)
 # A storage fault must surface as a 500/INTERNAL response, not a test crash.

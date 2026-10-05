@@ -9,7 +9,7 @@ from app import registry
 from app.engine import review
 from app.main import app
 from app.models import ReviewRequest
-from app.storage import get_store, reset_store
+from conftest import get_store, reset_store
 
 
 client = TestClient(app)
@@ -264,7 +264,7 @@ def test_failed_rereview_changes_nothing(monkeypatch):
 
     monkeypatch.setattr(reg_mod, "run_review", boom)
     with pytest.raises(RuntimeError):
-        registry.replace_registry([("users", "email")], 0)
+        registry.replace_registry(get_store(), [("users", "email")], 0)
 
     got = client.get(f"/api/graphs/{gid}").json()
     assert got["generation"] == 0
@@ -443,7 +443,7 @@ def test_preview_and_replacement_never_mix_registry_and_conclusion(monkeypatch):
     outcomes = {}
 
     def do_preview():
-        outcomes["preview"] = registry.preview_graph(gid, ROWS, CONDITIONS)
+        outcomes["preview"] = registry.preview_graph(get_store(), gid, ROWS, CONDITIONS)
 
     worker = threading.Thread(target=do_preview)
     worker.start()
@@ -452,7 +452,7 @@ def test_preview_and_replacement_never_mix_registry_and_conclusion(monkeypatch):
     pending = threading.Thread(
         target=lambda: outcomes.setdefault(
             "replace",
-            registry.replace_registry([("users", "email")], 0),
+            registry.replace_registry(get_store(), [("users", "email")], 0),
         )
     )
     pending.start()
@@ -486,7 +486,7 @@ def test_concurrent_replacements_serialize_one_stales_out():
         barrier.wait()
         try:
             registry.replace_registry(
-                [("users", "email")], generation)
+                get_store(), [("users", "email")], generation)
             outcomes.append(200)
         except registry.StaleGeneration:
             outcomes.append(409)
